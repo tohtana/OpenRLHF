@@ -14,6 +14,8 @@ from .utils import compute_entropy, log_probs_from_logits, process_sequences
 compute_entropy = torch.compile(compute_entropy)
 
 
+PAD_TOKEN_ID = 2
+
 class Actor(nn.Module):
     """
     Base class for Actor models in reinforcement learning.
@@ -57,7 +59,8 @@ class Actor(nn.Module):
         self.temperature = temperature
 
         if isinstance(pretrain_or_model, str):
-            attn_implementation = "flash_attention_2" if use_flash_attention_2 else "eager"
+            # attn_implementation = "flash_attention_2" if use_flash_attention_2 else "eager"
+            attn_implementation = "sdpa"
 
             # Note: dschf is defined in function scope to avoid global effects
             # https://huggingface.co/docs/transformers/deepspeed#non-trainer-deepspeed-integration
@@ -192,7 +195,16 @@ class Actor(nn.Module):
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
 
-        output = self.model(sequences, attention_mask=foward_attention_mask, position_ids=position_ids)
+        from deepspeed.compile import pad_tensors
+        padded_sequences, padded_position_ids = pad_tensors([
+            (sequences,      1, PAD_TOKEN_ID),
+            (position_ids,   1, 0),
+        ])
+        output = self.model(padded_sequences, attention_mask=foward_attention_mask, position_ids=padded_position_ids)
+
+        # Unpad
+        output["logits"] = output["logits"][:, :sequences.size(1), :]
+
         # https://github.com/OpenRLHF/OpenRLHF/pull/634
         output["logits"] = output["logits"].to(torch.float32)
 

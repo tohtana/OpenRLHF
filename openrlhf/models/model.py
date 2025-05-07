@@ -66,7 +66,8 @@ def get_llm_for_sequence_regression(
 
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
     config.normalize_reward = normalize_reward
-    config._attn_implementation = "flash_attention_2" if use_flash_attention_2 else "eager"
+    # config._attn_implementation = "flash_attention_2" if use_flash_attention_2 else "eager"
+    config._attn_implementation = "sdpa"
 
     # Prioritize using the value_head_prefix in the model configuration.
     value_head_prefix = getattr(config, "value_head_prefix", value_head_prefix)
@@ -75,9 +76,11 @@ def get_llm_for_sequence_regression(
     base_class = AutoModel._model_mapping[type(config)]
     base_pretrained_class = base_class.__base__
     if model_type == "reward":
-        cls_class = _get_reward_model(base_pretrained_class, base_class, value_head_prefix, packing_samples)
+        # cls_class = _get_reward_model(base_pretrained_class, base_class, value_head_prefix, packing_samples)
+        cls_class = _get_reward_model(base_pretrained_class, base_class, value_head_prefix, False)
     else:
-        cls_class = _get_critic_model(base_pretrained_class, base_class, value_head_prefix, packing_samples)
+        # cls_class = _get_critic_model(base_pretrained_class, base_class, value_head_prefix, packing_samples)
+        cls_class = _get_critic_model(base_pretrained_class, base_class, value_head_prefix, False)
 
     # Note: dschf is defined in function scope to avoid global effects
     # https://huggingface.co/docs/transformers/main_classes/deepspeed#nontrainer-deepspeed-integration

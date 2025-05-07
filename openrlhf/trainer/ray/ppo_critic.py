@@ -21,6 +21,9 @@ from ..ppo_utils import NaiveReplayBuffer
 from .launcher import BasePPORole
 
 
+PAD_TOKEN_ID = 2
+
+
 class CriticPPOTrainer(ABC):
     def __init__(
         self,
@@ -105,16 +108,24 @@ class CriticPPOTrainer(ABC):
         packed_seq_lens = None
         attention_mask = experience.attention_mask
 
+        from deepspeed.compile import pad_tensors
+        padded_sequences, padded_action_mask, padded_attention_mask = pad_tensors([
+            (sequences,      1, PAD_TOKEN_ID),
+            (action_mask,   1, 0),
+            (attention_mask,   1, 0),
+        ])
+
         # critic loss
         values, output = self.critic(
-            sequences,
-            action_mask=action_mask,
-            attention_mask=attention_mask,
+            padded_sequences,
+            action_mask=padded_action_mask,
+            attention_mask=padded_attention_mask,
             return_output=True,
             ring_attn_group=self.strategy.ring_attn_group,
             values_allgather=True,
             packed_seq_lens=packed_seq_lens,
         )
+        values = values[:, :old_values.size(1)]
 
         # loss function
         critic_loss = self.critic_loss_fn(
