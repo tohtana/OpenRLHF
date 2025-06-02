@@ -466,4 +466,8 @@ if __name__ == "__main__":
         # Patch hub to download models from modelscope to speed up.
         patch_hub()
 
+    import torch
+    torch._dynamo.config.accumulated_cache_size_limit = 256
+    torch._dynamo.config.cache_size_limit = 128
+
     train(args)

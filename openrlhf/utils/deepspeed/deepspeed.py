@@ -215,6 +215,11 @@ class DeepspeedStrategy(ABC):
         is_actor = isinstance(model, Actor)
         ds_config = self.get_ds_train_config(is_actor)
 
+        import logging
+        logger = logging.getLogger("openrlhf")
+        model_obj = model.model if is_actor else model
+        logger.info(f"_ds_init_train_model {model_obj.__class__} ds_config: {ds_config} self.deepcompile {self.deepcompile}")
+
         engine, optim, _, scheduler = deepspeed.initialize(
             model=model.model if is_actor else model,
             optimizer=optim,
@@ -259,12 +264,18 @@ class DeepspeedStrategy(ABC):
         is_actor = isinstance(model, Actor)
         ds_config = self.get_ds_eval_config(offload=getattr(model, "_offload", False))
 
+        import logging
+        logger = logging.getLogger("openrlhf")
+        model_obj = model.model if is_actor else model
+        logger.info(f"_ds_init_eval_model {model_obj.__class__} ds_config: {ds_config} self.deepcompile {self.deepcompile}")
+
         engine, *_ = deepspeed.initialize(
             model=model.model if is_actor else model,
             args={"local_rank": int(os.environ.get("LOCAL_RANK", "-1"))},
             config=ds_config,
             dist_init_required=True,
         )
+
         if self.deepcompile:
             engine.compile()
         if is_actor:
