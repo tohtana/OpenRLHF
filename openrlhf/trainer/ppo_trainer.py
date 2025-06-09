@@ -218,7 +218,18 @@ class PPOTrainer(ABC):
                 self.actor_model_group.async_run_method(method_name="reload_states")
 
             actor_status_ref = self.actor_model_group.async_run_method(method_name="fit", kl_ctl=self.kl_ctl.value)
-            status.update(ray.get(actor_status_ref)[0])
+            actor_status = ray.get(actor_status_ref)[0]
+            
+            # Log individual iteration data to wandb in real-time
+            if "iteration_logs" in actor_status and self._wandb is not None:
+                iteration_logs = actor_status.pop("iteration_logs")  # Remove from status to avoid duplicate logging
+                for iteration_log in iteration_logs:
+                    wandb_iter_logs = {
+                        f"actor_iter/{k}": v for k, v in iteration_log.items()
+                    }
+                    self._wandb.log(wandb_iter_logs)
+            
+            status.update(actor_status)
 
             if self.strategy.args.deepspeed_enable_sleep:
                 self.actor_model_group.async_run_method(method_name="offload_states")

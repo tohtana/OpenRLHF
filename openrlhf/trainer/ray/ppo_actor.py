@@ -5,6 +5,7 @@ from abc import ABC
 from typing import Dict, List, Optional, Union
 
 import deepspeed
+import numpy as np
 import ray
 import torch
 import torch.distributed
@@ -77,6 +78,9 @@ class ActorPPOTrainer(ABC):
             micro_train_batch_size, buffer_limit, buffer_cpu_offload, getattr(self.args, "packing_samples", False)
         )
 
+        # Global iteration counter for tracking across training sessions
+        self.global_iteration_counter = 0
+
         # Init torch group for weights sync
         backend = getattr(self.strategy.args, "vllm_sync_backend", "nccl")
         self.use_cuda_ipc = False
@@ -141,6 +145,14 @@ class ActorPPOTrainer(ABC):
         torch_dist_barrier_and_cuda_sync()
 
     def ppo_train(self, kl_ctl: float):
+        import time
+        
+        # Start timing for iteration speed tracking
+        train_start_time = time.time()
+        total_iterations = 0
+        iteration_times = []  # Store individual iteration times
+        iteration_logs = []  # Store individual iteration logs for real-time reporting
+        
         # replay buffer may be empty at first, we should rebuild at each training
         dataloader = DataLoader(
             self.replay_buffer,
@@ -161,11 +173,17 @@ class ActorPPOTrainer(ABC):
                 disable=not self.strategy.is_rank_0(),
             )
             for experience in pbar:
+                iteration_start_time = time.time()  # Start timing this iteration
+                
                 experience.to_device(device)
                 status = self.training_step(experience, kl_ctl)
                 status["kl"] *= status["response_length"]
                 status = self.strategy.all_reduce(status)
                 status["kl"] /= status["response_length"]
+
+                iteration_end_time = time.time()  # End timing this iteration
+                iteration_time = iteration_end_time - iteration_start_time
+                iteration_times.append(iteration_time)
 
                 short_status = {
                     "act_loss": status["policy_loss"],
@@ -180,9 +198,41 @@ class ActorPPOTrainer(ABC):
                 if "entropy_loss" in status:
                     short_status["ent_loss"] = status["entropy_loss"]
 
+                # Add short_status metrics to the main status for logging
+                for key, value in short_status.items():
+                    status[f"iter_{key}"] = value
+                
+                # Add iteration timing to status for real-time logging
+                status["iter_time"] = iteration_time
+                status["iteration_number"] = total_iterations
+
+                # Store iteration log for potential real-time reporting
+                self.global_iteration_counter += 1
+                iteration_log = {
+                    "global_iteration": self.global_iteration_counter,
+                    "session_iteration": total_iterations + 1,
+                    "iteration_time": iteration_time,
+                    **short_status
+                }
+                iteration_logs.append(iteration_log)
+                
+                # Print real-time metrics if rank 0
+                if self.strategy.is_rank_0():
+                    logger.info(f"Iteration {self.global_iteration_counter}: "
+                               f"loss={short_status['act_loss']:.4f}, "
+                               f"reward={short_status['reward']:.4f}, "
+                               f"return={short_status['return']:.4f}, "
+                               f"kl={short_status['kl']:.4f}, "
+                               f"time={iteration_time:.3f}s")
+
                 status_list.append(status)
                 pbar.set_postfix(short_status)
+                total_iterations += 1
 
+        # Calculate timing metrics
+        train_end_time = time.time()
+        total_train_time = train_end_time - train_start_time
+        
         if status_list:
             status_mean = status_list[0]
             for m in status_list[1:]:
@@ -190,6 +240,32 @@ class ActorPPOTrainer(ABC):
                     status_mean[k] += v
             for k in status_mean.keys():
                 status_mean[k] /= len(status_list)
+                
+            # Add iteration speed metrics to status for wandb logging
+            if total_train_time > 0:
+                status_mean["iterations_per_second"] = total_iterations / total_train_time
+                status_mean["seconds_per_iteration"] = total_train_time / total_iterations if total_iterations > 0 else 0
+            status_mean["total_train_time"] = total_train_time
+            status_mean["total_iterations"] = total_iterations
+            
+            # Add individual iteration timing statistics
+            if iteration_times:
+                iteration_times_array = np.array(iteration_times)
+                status_mean["iteration_time_mean"] = np.mean(iteration_times_array)
+                status_mean["iteration_time_std"] = np.std(iteration_times_array)
+                status_mean["iteration_time_min"] = np.min(iteration_times_array)
+                status_mean["iteration_time_max"] = np.max(iteration_times_array)
+                status_mean["iteration_time_median"] = np.median(iteration_times_array)
+                
+                # Add coefficient of variation to measure timing consistency
+                if status_mean["iteration_time_mean"] > 0:
+                    status_mean["iteration_time_cv"] = status_mean["iteration_time_std"] / status_mean["iteration_time_mean"]
+                else:
+                    status_mean["iteration_time_cv"] = 0.0
+            
+            # Add iteration logs for real-time monitoring
+            status_mean["iteration_logs"] = iteration_logs
+            
         return status_mean
 
     def training_step(self, experience: Experience, kl_ctl: float) -> Dict[str, float]:
