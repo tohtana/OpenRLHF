@@ -392,11 +392,11 @@ if __name__ == "__main__":
     parser.add_argument("--use_wandb", type=str, default=None)
     parser.add_argument("--wandb_org", type=str, default=None)
     parser.add_argument("--wandb_group", type=str, default=None)
-    parser.add_argument("--wandb_project", type=str, default="openrlhf_train_ppo")
+    parser.add_argument("--wandb_project", type=str, default="train_ppo_dc")
     parser.add_argument(
         "--wandb_run_name",
         type=str,
-        default="ppo_%s" % datetime.now().strftime("%m%dT%H:%M"),
+        default=None,
     )
 
     # TensorBoard parameters
@@ -409,6 +409,11 @@ if __name__ == "__main__":
     parser.add_argument("--use_ms", action="store_true", default=False)
 
     args = parser.parse_args()
+
+    # Set default wandb_run_name if not provided
+    if args.wandb_run_name is None:
+        dc_flag = "1" if args.deepcompile else "0"
+        args.wandb_run_name = f"ppo_dc{dc_flag}_{datetime.now().strftime('%m%dT%H%M')}"
 
     # Validate arguments
     if args.advantage_estimator not in ["gae"]:
