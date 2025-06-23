@@ -413,7 +413,8 @@ if __name__ == "__main__":
     # Set default wandb_run_name if not provided
     if args.wandb_run_name is None:
         dc_flag = "1" if args.deepcompile else "0"
-        args.wandb_run_name = f"ppo_dc{dc_flag}_{datetime.now().strftime('%m%dT%H%M')}"
+        fa_flag = "1" if args.flash_attn else "0"
+        args.wandb_run_name = f"ppo_dc{dc_flag}_fa{fa_flag}_{datetime.now().strftime('%m%dT%H%M')}"
 
     # Validate arguments
     if args.advantage_estimator not in ["gae"]:
