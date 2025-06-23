@@ -3,6 +3,7 @@ import os
 import socket
 from abc import ABC
 from typing import Dict, List, Optional, Union
+from contextlib import nullcontext
 
 import deepspeed
 import numpy as np
@@ -80,6 +81,12 @@ class ActorPPOTrainer(ABC):
 
         # Global iteration counter for tracking across training sessions
         self.global_iteration_counter = 0
+
+        # PyTorch profiler configuration
+        self.enable_profiler = getattr(self.args, "enable_profiler", False)
+        self.profiler_trace_dir = getattr(self.args, "profiler_trace_dir", "./profiler_traces")
+        self.profiler = None
+        self.profile_done = False
 
         # Init torch group for weights sync
         backend = getattr(self.strategy.args, "vllm_sync_backend", "nccl")
@@ -164,70 +171,111 @@ class ActorPPOTrainer(ABC):
         )
         device = torch.cuda.current_device()
 
+        # Initialize profiler if enabled
+        profiler_context = None
+        if self.enable_profiler and self.strategy.is_rank_0() and not self.profile_done:
+            # Create profiler trace directory if it doesn't exist
+            os.makedirs(self.profiler_trace_dir, exist_ok=True)
+            
+            # Calculate total expected steps for profiler scheduling
+            total_steps = len(dataloader) * self.max_epochs
+            profiler_steps = min(total_steps, getattr(self.args, "profiler_steps", 10))  # Profile first 10 steps by default
+            
+            # Create profiler with activities and schedule
+            from torch.profiler import profile, ProfilerActivity, schedule
+            
+            dc_flag = "1" if self.strategy.args.deepcompile else "0"
+            logger.info(f"Enabling profiler for {profiler_steps} steps, traces will be saved to {self.profiler_trace_dir}")
+            
+            profiler_context = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    os.path.join(self.profiler_trace_dir, f"ppo_train_trace_dc{dc_flag}_{int(time.time())}")),
+                schedule=schedule(
+                    wait=2,           # Skip first step
+                    warmup=4,         # Warmup for 1 step
+                    active=profiler_steps,  # Profile for specified steps
+                    repeat=3          # Only do this once
+                )
+            )
+            self.profile_done = True  # Ensure profiler is only set up once
+
         status_list = []
         status_mean = {}
-        for epoch in range(self.max_epochs):
-            pbar = tqdm(
-                dataloader,
-                desc=f"Train epoch [{epoch + 1}/{self.max_epochs}]",
-                disable=not self.strategy.is_rank_0(),
-            )
-            for experience in pbar:
-                iteration_start_time = time.time()  # Start timing this iteration
-                
-                experience.to_device(device)
-                status = self.training_step(experience, kl_ctl)
-                status["kl"] *= status["response_length"]
-                status = self.strategy.all_reduce(status)
-                status["kl"] /= status["response_length"]
+        
+        # Use profiler context for the entire training loop
+        with profiler_context if profiler_context else nullcontext():
+            for epoch in range(self.max_epochs):
+                pbar = tqdm(
+                    dataloader,
+                    desc=f"Train epoch [{epoch + 1}/{self.max_epochs}]",
+                    disable=not self.strategy.is_rank_0(),
+                )
+                for i, experience in enumerate(pbar):
+                    # Step profiler if enabled
+                    if profiler_context:
+                        profiler_context.step()
+                    
+                    torch.cuda.synchronize()
+                    iteration_start_time = time.time()  # Start timing this iteration
 
-                iteration_end_time = time.time()  # End timing this iteration
-                iteration_time = iteration_end_time - iteration_start_time
-                iteration_times.append(iteration_time)
+                    experience.to_device(device)
+                    status = self.training_step(experience, kl_ctl)
+                    status["kl"] *= status["response_length"]
+                    status = self.strategy.all_reduce(status)
+                    status["kl"] /= status["response_length"]
 
-                short_status = {
-                    "act_loss": status["policy_loss"],
-                    "reward": status["reward"],
-                    "return": status["return"],
-                    "gen_len": status["response_length"],
-                    "tot_len": status["total_length"],
-                    "kl": status["kl"],
-                    "act_lr": status["actor_lr"],
-                }
+                    torch.cuda.synchronize()
+                    iteration_end_time = time.time()  # End timing this iteration
+                    iteration_time = iteration_end_time - iteration_start_time
+                    iteration_times.append(iteration_time)
 
-                if "entropy_loss" in status:
-                    short_status["ent_loss"] = status["entropy_loss"]
+                    short_status = {
+                        "act_loss": status["policy_loss"],
+                        "reward": status["reward"],
+                        "return": status["return"],
+                        "gen_len": status["response_length"],
+                        "tot_len": status["total_length"],
+                        "kl": status["kl"],
+                        "act_lr": status["actor_lr"],
+                    }
 
-                # Add short_status metrics to the main status for logging
-                for key, value in short_status.items():
-                    status[f"iter_{key}"] = value
-                
-                # Add iteration timing to status for real-time logging
-                status["iter_time"] = iteration_time
-                status["iteration_number"] = total_iterations
+                    if "entropy_loss" in status:
+                        short_status["ent_loss"] = status["entropy_loss"]
 
-                # Store iteration log for potential real-time reporting
-                self.global_iteration_counter += 1
-                iteration_log = {
-                    "global_iteration": self.global_iteration_counter,
-                    "session_iteration": total_iterations + 1,
-                    "iteration_time": iteration_time,
-                    **short_status
-                }
-                iteration_logs.append(iteration_log)
-                
-                # Print real-time metrics if rank 0
-                if self.strategy.is_rank_0():
-                    logger.info(f"Iteration {self.global_iteration_counter}: "
-                               f"loss={short_status['act_loss']:.4f}, "
-                               f"reward={short_status['reward']:.4f}, "
-                               f"return={short_status['return']:.4f}, "
-                               f"kl={short_status['kl']:.4f}, "
-                               f"time={iteration_time:.3f}s")
+                    # Add short_status metrics to the main status for logging
+                    for key, value in short_status.items():
+                        status[f"iter_{key}"] = value
+                    
+                    # Add iteration timing to status for real-time logging
+                    status["iter_time"] = iteration_time
+                    status["iteration_number"] = total_iterations
 
-                status_list.append(status)
-                pbar.set_postfix(short_status)
-                total_iterations += 1
+                    # Store iteration log for potential real-time reporting
+                    self.global_iteration_counter += 1
+                    iteration_log = {
+                        "global_iteration": self.global_iteration_counter,
+                        "session_iteration": total_iterations + 1,
+                        "iteration_time": iteration_time,
+                        **short_status
+                    }
+                    iteration_logs.append(iteration_log)
+                    
+                    # Print real-time metrics if rank 0
+                    if self.strategy.is_rank_0():
+                        logger.info(f"Iteration {self.global_iteration_counter}: "
+                                   f"loss={short_status['act_loss']:.4f}, "
+                                   f"reward={short_status['reward']:.4f}, "
+                                   f"return={short_status['return']:.4f}, "
+                                   f"kl={short_status['kl']:.4f}, "
+                                   f"time={iteration_time:.3f}s")
+
+                    status_list.append(status)
+                    pbar.set_postfix(short_status)
+                    total_iterations += 1
 
         # Calculate timing metrics
         train_end_time = time.time()
@@ -269,6 +317,8 @@ class ActorPPOTrainer(ABC):
         return status_mean
 
     def training_step(self, experience: Experience, kl_ctl: float) -> Dict[str, float]:
+        import time
+        
         self.actor.train()
 
         sequences = experience.sequences
@@ -279,52 +329,79 @@ class ActorPPOTrainer(ABC):
         advantages = experience.advantages
         base_action_log_probs = experience.base_action_log_probs
 
-        # actor loss
-        action_log_probs, output = self.actor(
-            sequences,
-            action_mask,
-            attention_mask=attention_mask,
-            return_output=True,
-            ring_attn_group=self.strategy.ring_attn_group,
-            packed_seq_lens=packed_seq_lens,
-            return_entropy=self.args.entropy_loss_coef > 1e-8,
-        )
+        # actor forward pass with timing and profiling
+        torch.cuda.synchronize()
+        forward_start_time = time.time()
+        
+        with torch.profiler.record_function("actor_forward"):
+            action_log_probs, output = self.actor(
+                sequences,
+                action_mask,
+                attention_mask=attention_mask,
+                return_output=True,
+                ring_attn_group=self.strategy.ring_attn_group,
+                packed_seq_lens=packed_seq_lens,
+                return_entropy=self.args.entropy_loss_coef > 1e-8,
+            )
+        
+        torch.cuda.synchronize()
+        forward_end_time = time.time()
+        forward_time = forward_end_time - forward_start_time
 
         # loss function
-        actor_loss = self.actor_loss_fn(
-            action_log_probs,
-            old_action_log_probs,
-            advantages,
-            action_mask=experience.action_mask,
-        )
+        with torch.profiler.record_function("loss_computation"):
+            actor_loss = self.actor_loss_fn(
+                action_log_probs,
+                old_action_log_probs,
+                advantages,
+                action_mask=experience.action_mask,
+            )
 
-        if self.args.use_kl_loss:
-            if self.args.init_kl_coef > 0:
-                kl = compute_approx_kl(
-                    action_log_probs,
-                    base_action_log_probs,
-                    kl_estimator=self.args.kl_estimator,
-                )
+            if self.args.use_kl_loss:
+                if self.args.init_kl_coef > 0:
+                    kl = compute_approx_kl(
+                        action_log_probs,
+                        base_action_log_probs,
+                        kl_estimator=self.args.kl_estimator,
+                    )
+                else:
+                    kl = torch.zeros_like(action_log_probs, dtype=action_log_probs.dtype, device=action_log_probs.device)
+                kl_loss = masked_mean(kl, experience.action_mask)
+                experience.info["kl"] = kl_loss.detach().item()
             else:
-                kl = torch.zeros_like(action_log_probs, dtype=action_log_probs.dtype, device=action_log_probs.device)
-            kl_loss = masked_mean(kl, experience.action_mask)
-            experience.info["kl"] = kl_loss.detach().item()
-        else:
-            kl_loss = 0
+                kl_loss = 0
 
-        loss = actor_loss + kl_loss * kl_ctl
-        # mixtral
-        if self.aux_loss:
-            loss += output.aux_loss * self.args.aux_loss_coef
-        # entropy loss
-        if self.args.entropy_loss_coef > 1e-8:
-            entropy_loss = masked_mean(output.entropy[:, -experience.action_mask.shape[1] :], experience.action_mask)
-            loss -= entropy_loss * self.args.entropy_loss_coef
+            loss = actor_loss + kl_loss * kl_ctl
+            # mixtral
+            if self.aux_loss:
+                loss += output.aux_loss * self.args.aux_loss_coef
+            # entropy loss
+            if self.args.entropy_loss_coef > 1e-8:
+                entropy_loss = masked_mean(output.entropy[:, -experience.action_mask.shape[1] :], experience.action_mask)
+                loss -= entropy_loss * self.args.entropy_loss_coef
 
-        self.strategy.backward(loss, self.actor, self.actor_optim)
-        self.strategy.optimizer_step(self.actor_optim, self.actor, self.actor_scheduler, name="actor")
-        if self.ema_model:
-            self.strategy.moving_average(self.actor, self.ema_model, self.ema_beta, "cuda")
+        # actor backward pass with timing and profiling
+        torch.cuda.synchronize()
+        backward_start_time = time.time()
+        
+        with torch.profiler.record_function("actor_backward"):
+            self.strategy.backward(loss, self.actor, self.actor_optim)
+        
+        torch.cuda.synchronize()
+        backward_end_time = time.time()
+        backward_time = backward_end_time - backward_start_time
+        
+        with torch.profiler.record_function("optimizer_step"):
+            self.strategy.optimizer_step(self.actor_optim, self.actor, self.actor_scheduler, name="actor")
+        
+        torch.cuda.synchronize()
+        step_time = time.time() - backward_end_time
+        
+        with torch.profiler.record_function("ema_update"):
+            if self.ema_model:
+                self.strategy.moving_average(self.actor, self.ema_model, self.ema_beta, "cuda")
+        
+        torch.cuda.synchronize()
 
         # status
         status = {"policy_loss": actor_loss.detach().item(), "actor_lr": self.actor_scheduler.get_last_lr()[0]}
@@ -332,6 +409,13 @@ class ActorPPOTrainer(ABC):
             status["entropy_loss"] = entropy_loss.detach().item()
         for k, v in experience.info.items():
             status[k] = v.mean().item()
+        
+        # Add forward and backward timing to status
+        status["actor_forward_time"] = forward_time
+        status["actor_backward_time"] = backward_time
+        status["actor_step_time"] = step_time
+        status["actor_total_time"] = forward_time + backward_time
+        
         return status
 
     def _broadcast_to_vllm(self):
