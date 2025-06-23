@@ -249,7 +249,7 @@ class DeepspeedStrategy(ABC):
             grad_accum_dtype=self.grad_accum_dtype,
             overlap_comm=self.overlap_comm,
             use_ds_universal_ckpt=self.use_ds_universal_ckpt,
-            deepcompile=self.deepcompile,
+            deepcompile=self.deepcompile and is_actor,
         )
 
         ds_config["train_micro_batch_size_per_gpu"] = self.micro_train_batch_size
@@ -276,7 +276,7 @@ class DeepspeedStrategy(ABC):
             dist_init_required=True,
         )
 
-        if self.deepcompile:
+        if self.deepcompile and is_actor:
             engine.compile()
         if is_actor:
             model.model = engine
@@ -287,7 +287,9 @@ class DeepspeedStrategy(ABC):
     def get_ds_eval_config(self, offload=False):
         # DS Config
         ds_config = get_eval_ds_config(
-            offload=offload, stage=self.stage if self.stage == 3 else 0, bf16=self.bf16, deepcompile=self.deepcompile
+            offload=offload, stage=self.stage if self.stage == 3 else 0, bf16=self.bf16,
+            # deepcompile=self.deepcompile,
+            deepcompile=False
         )
         ds_config["train_micro_batch_size_per_gpu"] = self.micro_train_batch_size
         ds_config["train_batch_size"] = self.train_batch_size * self.ring_attn_size
