@@ -523,6 +523,7 @@ class ActorModelRayActor(BasePPORole):
             packing_samples=strategy.args.packing_samples,
             temperature=strategy.args.temperature,
             use_liger_kernel=strategy.args.use_liger_kernel,
+            deepcompile=strategy.args.deepcompile,
         )
         strategy.print(actor)
 

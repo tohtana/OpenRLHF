@@ -36,6 +36,7 @@ class Actor(nn.Module):
         packing_samples (bool, optional): Whether to pack samples during training. Defaults to False.
         temperature (float, optional): Temperature for action selection. Defaults to 1.0.
         use_liger_kernel (bool, optional): Whether to use Liger Kernel for the model. Defaults to False.
+        deepcompile (bool, optional): Whether DeepSpeed compile is enabled. Affects attention implementation choice. Defaults to False.
     """
 
     def __init__(
@@ -53,14 +54,21 @@ class Actor(nn.Module):
         packing_samples=False,
         temperature=1.0,
         use_liger_kernel=False,
+        deepcompile=False,
         **kwargs,
     ) -> None:
         super().__init__()
         self.temperature = temperature
 
         if isinstance(pretrain_or_model, str):
-            # attn_implementation = "flash_attention_2" if use_flash_attention_2 else "eager"
-            attn_implementation = "sdpa"
+            # Set attention implementation based on use_flash_attention_2 and deepcompile settings
+            if use_flash_attention_2:
+                if deepcompile:
+                    attn_implementation = "sdpa"
+                else:
+                    attn_implementation = "flash_attention_2"
+            else:
+                attn_implementation = "eager"
 
             # Note: dschf is defined in function scope to avoid global effects
             # https://huggingface.co/docs/transformers/deepspeed#non-trainer-deepspeed-integration
